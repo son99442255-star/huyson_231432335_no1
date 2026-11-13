@@ -1,0 +1,170 @@
+/*
+  MẠCH BÁO CHÁY GIA ĐÌNH - ESP32 + MQ2 + DHT22 + FreeRTOS + MQTT
+  - Task truyền data  (Core 0): WiFi + MQTT, đọc data Queue -> publish
+  - Task đọc data     (Core 1): đọc MQ2 + nhiệt độ, in Serial, đẩy vào dataQueue & alertQueue
+  - Task cảnh báo     (Core 1): đọc alertQueue -> điều khiển quạt (gas) và máy bơm (nhiệt)
+  Thư viện cần: PubSubClient, DHT sensor library (Adafruit), ArduinoJson (không bắt buộc)
+*/
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// ---------------- Cấu hình ----------------
+#define WIFI_SSID   "Wokwi-GUEST"
+#define WIFI_PASS   ""
+#define MQTT_HOST   "broker.hivemq.com"
+#define MQTT_PORT   1883
+
+// Đổi "son" thành tên riêng của bạn để không trùng người khác
+#define TOPIC_DATA  "baochay/son/data"
+#define TOPIC_CMD   "baochay/son/cmd"
+
+#define PIN_MQ2     34   // AOUT của MQ2 (ADC1)
+#define PIN_DHT     15
+#define PIN_FAN     26   // quạt   (LED xanh / relay)
+#define PIN_PUMP    27   // máy bơm (LED đỏ / relay)
+
+#define GAS_THRESHOLD   2000   // ppm (quy đổi gần đúng)
+#define TEMP_THRESHOLD  50.0   // °C
+
+// ---------------- Kiểu dữ liệu ----------------
+typedef struct {
+  float gas;     // ppm
+  float temp;    // °C
+} SensorData;
+
+// ---------------- Biến toàn cục ----------------
+DHT dht(PIN_DHT, DHT22);
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+QueueHandle_t dataQueue;    // gửi lên MQTT (hàng đợi dài 10)
+QueueHandle_t alertQueue;   // cho task cảnh báo (dài 1, luôn giữ giá trị mới nhất)
+
+volatile bool manualMode = false;  // false = tự động, true = điều khiển tay từ web
+volatile bool fanState   = false;
+volatile bool pumpState  = false;
+volatile bool fanManual  = false;
+volatile bool pumpManual = false;
+
+// ---------------- MQTT: nhận lệnh từ web ----------------
+// Lệnh dạng: "mode:manual" | "mode:auto" | "fan:on" | "fan:off" | "pump:on" | "pump:off"
+void onMessage(char* topic, byte* payload, unsigned int len) {
+  String msg;
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  msg.toLowerCase();
+  Serial.println("[MQTT] lệnh: " + msg);
+
+  if      (msg == "mode:manual") manualMode = true;
+  else if (msg == "mode:auto")   manualMode = false;
+  else if (msg == "fan:on")      fanManual  = true;
+  else if (msg == "fan:off")     fanManual  = false;
+  else if (msg == "pump:on")     pumpManual = true;
+  else if (msg == "pump:off")    pumpManual = false;
+}
+
+// ---------------- TASK TRUYỀN DATA (Core 0) ----------------
+void taskTruyenData(void* pv) {
+  // 1. Kết nối WiFi
+  Serial.print("Đang kết nối WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi OK, IP: " + WiFi.localIP().toString());
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMessage);
+
+  SensorData d;
+  char buf[160];
+
+  for (;;) {
+    // 2. Giữ kết nối MQTT
+    if (!mqtt.connected()) {
+      String cid = "esp32-baochay-" + String((uint32_t)esp_random(), HEX);
+      if (mqtt.connect(cid.c_str())) {
+        mqtt.subscribe(TOPIC_CMD);
+        Serial.println("MQTT OK");
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
+      }
+    }
+    mqtt.loop();
+
+    // 3. Lấy dữ liệu từ data Queue rồi publish
+    if (xQueueReceive(dataQueue, &d, pdMS_TO_TICKS(100)) == pdTRUE) {
+      snprintf(buf, sizeof(buf),
+               "{\"gas\":%.0f,\"temp\":%.1f,\"fan\":%d,\"pump\":%d,\"manual\":%d}",
+               d.gas, d.temp, fanState ? 1 : 0, pumpState ? 1 : 0, manualMode ? 1 : 0);
+      mqtt.publish(TOPIC_DATA, buf);
+    }
+  }
+}
+
+// ---------------- TASK ĐỌC DATA (Core 1) ----------------
+void taskDocData(void* pv) {
+  SensorData d;
+  for (;;) {
+    int raw = analogRead(PIN_MQ2);                    // 0..4095
+    d.gas  = map(raw, 0, 4095, 200, 10000);           // quy đổi gần đúng sang ppm
+    d.temp = dht.readTemperature();
+    if (isnan(d.temp)) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+    Serial.printf("Gas: %.0f ppm | Nhiet do: %.1f C\n", d.gas, d.temp);
+
+    xQueueSend(dataQueue, &d, 0);        // gửi đầy đủ cho task truyền
+    xQueueOverwrite(alertQueue, &d);     // giữ bản mới nhất cho task cảnh báo
+
+    vTaskDelay(pdMS_TO_TICKS(2000));     // chu kỳ 2 giây
+  }
+}
+
+// ---------------- TASK CẢNH BÁO (Core 1) ----------------
+void taskCanhBao(void* pv) {
+  SensorData d;
+  for (;;) {
+    if (xQueueReceive(alertQueue, &d, pdMS_TO_TICKS(200)) == pdTRUE) {
+      if (manualMode) {
+        fanState  = fanManual;
+        pumpState = pumpManual;
+      } else {
+        fanState  = (d.gas  > GAS_THRESHOLD);    // gas vượt ngưỡng -> bật quạt
+        pumpState = (d.temp > TEMP_THRESHOLD);   // nhiệt vượt ngưỡng -> bật bơm
+      }
+      digitalWrite(PIN_FAN,  fanState);
+      digitalWrite(PIN_PUMP, pumpState);
+
+      if (!manualMode && (fanState || pumpState))
+        Serial.printf("!!! CANH BAO: quat=%d, bom=%d\n", fanState, pumpState);
+    } else if (manualMode) {
+      // lệnh tay có hiệu lực ngay, không cần chờ dữ liệu mới
+      fanState  = fanManual;
+      pumpState = pumpManual;
+      digitalWrite(PIN_FAN,  fanState);
+      digitalWrite(PIN_PUMP, pumpState);
+    }
+  }
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_FAN,  OUTPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  dht.begin();
+
+  dataQueue  = xQueueCreate(10, sizeof(SensorData));
+  alertQueue = xQueueCreate(1,  sizeof(SensorData));
+
+  //                 hàm            tên            stack  tham số  ưu tiên handle  core
+  xTaskCreatePinnedToCore(taskTruyenData, "TruyenData", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(taskDocData,    "DocData",    4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskCanhBao,    "CanhBao",    4096, NULL, 3, NULL, 1);
+}
+
+void loop() {
+  vTaskDelete(NULL);   // loop không dùng, mọi việc do các task đảm nhiệm
+}

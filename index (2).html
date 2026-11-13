@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trung tâm báo cháy gia đình</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --paper: #E9EDEB;
+    --panel: #F7F9F8;
+    --ink: #14232B;
+    --steel: #5B6D75;
+    --line: #C5CFCB;
+    --safe: #17805F;
+    --warn: #C8281E;
+    --amber: #D99A00;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: "Barlow", system-ui, sans-serif; line-height: 1.5;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 48px; }
+
+  /* Dải trạng thái: đổi màu khi có cảnh báo */
+  .status {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 18px 22px; border-radius: 6px; color: #fff; background: var(--safe);
+    transition: background .3s;
+  }
+  .status.alarm { background: var(--warn); animation: pulse 1s steps(2, jump-none) infinite; }
+  .status.offline { background: var(--steel); }
+  .status h1 { margin: 0; font: 700 1.7rem/1.1 "Barlow Semi Condensed", sans-serif; }
+  .status p { margin: 2px 0 0; opacity: .9; font-size: .95rem; }
+  .conn { font-weight: 600; font-size: .9rem; }
+  @keyframes pulse { 50% { background: #9E1D15; } }
+
+  .readings { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  .reading { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 18px 22px; }
+  .reading h2 { margin: 0; font-size: 1rem; font-weight: 500; color: var(--steel); }
+  .reading .num { font: 700 4rem/1.05 "Barlow Semi Condensed", sans-serif; letter-spacing: -.01em; }
+  .reading .unit { font: 500 1.2rem "Barlow Semi Condensed", sans-serif; color: var(--steel); margin-left: 6px; }
+  .reading .limit { font-size: .9rem; color: var(--steel); }
+  .reading.over { border-color: var(--warn); }
+  .reading.over .num { color: var(--warn); }
+
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; height: 260px; }
+
+  .controls { margin-top: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 18px 22px; }
+  .controls h2 { margin: 0 0 12px; font: 600 1.1rem "Barlow Semi Condensed", sans-serif; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 12px; }
+  button {
+    font: 600 1rem "Barlow", sans-serif; padding: 12px 20px; min-width: 190px;
+    border-radius: 6px; border: 2px solid var(--ink); background: #fff; color: var(--ink); cursor: pointer;
+  }
+  button:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.on { background: var(--ink); color: #fff; }
+  .hint { margin: 10px 0 0; font-size: .9rem; color: var(--steel); }
+
+  @media (max-width: 680px) {
+    .readings, .charts { grid-template-columns: 1fr; }
+    .reading .num { font-size: 3.2rem; }
+    button { width: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) { .status.alarm { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section class="status offline" id="status">
+    <div>
+      <h1 class="status-title">Đang kết nối…</h1>
+      <p class="status-text">Chờ dữ liệu từ ESP32</p>
+    </div>
+    <div class="conn" id="conn">MQTT: chưa kết nối</div>
+  </section>
+
+  <!-- 2 thẻ hiển thị dữ liệu dạng số (truy cập bằng class) -->
+  <section class="readings">
+    <div class="reading gas-card">
+      <h2>Nồng độ khí gas</h2>
+      <div><span class="num gas-value">--</span><span class="unit">ppm</span></div>
+      <div class="limit">Ngưỡng bật quạt: 2000 ppm</div>
+    </div>
+    <div class="reading temp-card">
+      <h2>Nhiệt độ</h2>
+      <div><span class="num temp-value">--</span><span class="unit">°C</span></div>
+      <div class="limit">Ngưỡng bật máy bơm: 50 °C</div>
+    </div>
+  </section>
+
+  <!-- 2 biểu đồ thời gian thực -->
+  <section class="charts">
+    <div class="chart-box"><canvas id="gasChart"></canvas></div>
+    <div class="chart-box"><canvas id="tempChart"></canvas></div>
+  </section>
+
+  <!-- Điều khiển -->
+  <section class="controls">
+    <h2>Điều khiển</h2>
+    <div class="btn-row">
+      <button class="btn-mode" id="btnMode">Chế độ: Tự động</button>
+      <button class="btn-fan" id="btnFan" disabled>Quạt: Tắt</button>
+      <button class="btn-pump" id="btnPump" disabled>Máy bơm: Tắt</button>
+    </div>
+    <p class="hint">Chuyển sang chế độ thủ công để bật/tắt quạt và máy bơm bằng tay.</p>
+  </section>
+</div>
+
+<script>
+  // ====== Cấu hình (phải trùng với code ESP32) ======
+  const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+  const TOPIC_DATA = "baochay/son/data";
+  const TOPIC_CMD  = "baochay/son/cmd";
+  const GAS_TH = 2000, TEMP_TH = 50;
+  const MAX_POINTS = 30;
+
+  // ====== Biểu đồ ======
+  function makeChart(id, label, color, yMin, yMax) {
+    return new Chart(document.getElementById(id), {
+      type: "line",
+      data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + "22",
+              fill: true, tension: .25, pointRadius: 0, borderWidth: 2 }] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false,
+                 scales: { y: { min: yMin, max: yMax } },
+                 plugins: { legend: { position: "bottom" } } }
+    });
+  }
+  const gasChart  = makeChart("gasChart",  "Khí gas (ppm)", "#D99A00", 0, 10000);
+  const tempChart = makeChart("tempChart", "Nhiệt độ (°C)", "#C8281E", 0, 80);
+
+  function pushPoint(chart, v) {
+    chart.data.labels.push(new Date().toLocaleTimeString("vi-VN"));
+    chart.data.datasets[0].data.push(v);
+    if (chart.data.labels.length > MAX_POINTS) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+    chart.update();
+  }
+
+  // ====== MQTT ======
+  const client = mqtt.connect(BROKER_URL, { clientId: "web-baochay-" + Math.random().toString(16).slice(2, 8) });
+  let state = { manual: false, fan: false, pump: false };
+
+  client.on("connect", () => {
+    document.getElementById("conn").textContent = "MQTT: đã kết nối";
+    client.subscribe(TOPIC_DATA);
+  });
+  client.on("close", () => { document.getElementById("conn").textContent = "MQTT: mất kết nối"; });
+
+  client.on("message", (topic, payload) => {
+    let d;
+    try { d = JSON.parse(payload.toString()); } catch { return; }
+
+    // Cập nhật 2 thẻ số bằng class
+    document.querySelector(".gas-value").textContent  = d.gas;
+    document.querySelector(".temp-value").textContent = d.temp;
+    document.querySelector(".gas-card").classList.toggle("over", d.gas > GAS_TH);
+    document.querySelector(".temp-card").classList.toggle("over", d.temp > TEMP_TH);
+
+    pushPoint(gasChart, d.gas);
+    pushPoint(tempChart, d.temp);
+
+    state = { manual: !!d.manual, fan: !!d.fan, pump: !!d.pump };
+    renderControls();
+    renderStatus(d);
+  });
+
+  function renderStatus(d) {
+    const box = document.getElementById("status");
+    const title = box.querySelector(".status-title");
+    const text = box.querySelector(".status-text");
+    const gasHigh = d.gas > GAS_TH, tempHigh = d.temp > TEMP_TH;
+    box.classList.remove("offline");
+    box.classList.toggle("alarm", gasHigh || tempHigh);
+    if (gasHigh && tempHigh)      { title.textContent = "Cảnh báo cháy"; text.textContent = "Gas và nhiệt độ đều vượt ngưỡng. Quạt và máy bơm đang chạy."; }
+    else if (gasHigh)             { title.textContent = "Cảnh báo rò rỉ gas"; text.textContent = "Nồng độ gas vượt ngưỡng. Quạt thông gió đang bật."; }
+    else if (tempHigh)            { title.textContent = "Cảnh báo nhiệt độ cao"; text.textContent = "Nhiệt độ vượt ngưỡng. Máy bơm đang bật."; }
+    else                          { title.textContent = "An toàn"; text.textContent = "Gas và nhiệt độ trong giới hạn cho phép."; }
+  }
+
+  function renderControls() {
+    const m = document.getElementById("btnMode"), f = document.getElementById("btnFan"), p = document.getElementById("btnPump");
+    m.textContent = "Chế độ: " + (state.manual ? "Thủ công" : "Tự động");
+    m.classList.toggle("on", state.manual);
+    f.textContent = "Quạt: " + (state.fan ? "Bật" : "Tắt");
+    p.textContent = "Máy bơm: " + (state.pump ? "Bật" : "Tắt");
+    f.classList.toggle("on", state.fan);
+    p.classList.toggle("on", state.pump);
+    f.disabled = p.disabled = !state.manual;
+  }
+
+  // ====== Nút điều khiển ======
+  const send = (msg) => client.publish(TOPIC_CMD, msg);
+  document.getElementById("btnMode").onclick = () => send(state.manual ? "mode:auto" : "mode:manual");
+  document.getElementById("btnFan").onclick  = () => send(state.fan  ? "fan:off"  : "fan:on");
+  document.getElementById("btnPump").onclick = () => send(state.pump ? "pump:off" : "pump:on");
+</script>
+</body>
+</html>
